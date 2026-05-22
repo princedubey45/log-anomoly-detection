@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Log Anomaly Detection</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ── HEADER ─────────────────────────────────────── -->
+  <header>
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon">⚡</span>
+        <span class="logo-text">AnomalyWatch</span>
+      </div>
+      <div class="header-status">
+        <span id="model-badge" class="badge badge-gray">Model: Loading...</span>
+        <span id="stream-badge" class="badge badge-gray">Stream: Idle</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── MAIN LAYOUT ────────────────────────────────── -->
+  <main>
+
+    <!-- ── STAT CARDS ─────────────────────────────── -->
+    <section class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Total Logs</div>
+        <div class="stat-value" id="stat-total">—</div>
+      </div>
+      <div class="stat-card stat-green">
+        <div class="stat-label">Normal</div>
+        <div class="stat-value" id="stat-normal">—</div>
+      </div>
+      <div class="stat-card stat-red">
+        <div class="stat-label">Anomalies</div>
+        <div class="stat-value" id="stat-anomaly">—</div>
+      </div>
+      <div class="stat-card stat-yellow">
+        <div class="stat-label">Anomaly Rate</div>
+        <div class="stat-value" id="stat-rate">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Avg CPU</div>
+        <div class="stat-value" id="stat-cpu">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Avg Memory</div>
+        <div class="stat-value" id="stat-mem">—</div>
+      </div>
+    </section>
+
+    <!-- ── CHARTS ROW ─────────────────────────────── -->
+    <section class="charts-row">
+      <div class="chart-card">
+        <div class="chart-title">CPU Usage Over Time</div>
+        <canvas id="chart-cpu"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Memory Usage Over Time</div>
+        <canvas id="chart-mem"></canvas>
+      </div>
+      <div class="chart-card chart-small">
+        <div class="chart-title">Anomaly Breakdown</div>
+        <canvas id="chart-donut"></canvas>
+      </div>
+    </section>
+
+    <!-- ── CONTROLS ───────────────────────────────── -->
+    <section class="controls-row">
+      <div class="controls-left">
+        <button id="btn-stream" class="btn btn-primary" onclick="startStream()">
+          ▶ Start Live Stream
+        </button>
+        <button id="btn-pipeline" class="btn btn-secondary" onclick="runPipeline()">
+          ⚙ Re-run Pipeline
+        </button>
+        <button class="btn btn-ghost" onclick="loadStats()">
+          ↻ Refresh Stats
+        </button>
+      </div>
+      <div class="controls-right">
+        <select id="log-filter" onchange="loadLogs(1)">
+          <option value="all">All Logs</option>
+          <option value="anomaly">Anomalies Only</option>
+          <option value="normal">Normal Only</option>
+        </select>
+        <input id="search-box" type="text" placeholder="Search process name..."
+               oninput="filterTable()" />
+      </div>
+    </section>
+
+    <!-- ── PIPELINE STATUS ────────────────────────── -->
+    <div id="pipeline-status" class="pipeline-status hidden">
+      <div class="pipeline-header">
+        <span class="pipeline-title">⚙ Pipeline Running</span>
+        <button class="close-btn" onclick="closePipeline()">✕</button>
+      </div>
+      <div id="pipeline-steps" class="pipeline-steps"></div>
+    </div>
+
+    <!-- ── LIVE FEED ───────────────────────────────── -->
+    <section class="live-feed-section">
+      <div class="section-header">
+        <h2>Live Detection Feed</h2>
+        <span id="live-count" class="live-count">0 events</span>
+      </div>
+      <div id="live-feed" class="live-feed">
+        <div class="feed-empty">Start the live stream to see real-time anomaly detection.</div>
+      </div>
+    </section>
+
+    <!-- ── LOG TABLE ──────────────────────────────── -->
+    <section class="table-section">
+      <div class="section-header">
+        <h2>Log History</h2>
+        <div class="pagination" id="pagination"></div>
+      </div>
+      <div class="table-wrap">
+        <table id="log-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Status</th>
+              <th>CPU Max</th>
+              <th>Memory</th>
+              <th>Disk R</th>
+              <th>Disk W</th>
+              <th>Net Sent</th>
+              <th>Net Recv</th>
+              <th>Top Process</th>
+              <th>Anomaly Type</th>
+              <th>Score</th>
+            </tr>
+          </thead>
+          <tbody id="log-tbody">
+            <tr><td colspan="11" class="empty-row">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ── ANOMALY TOAST ──────────────────────────────── -->
+  <div id="toast-container"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

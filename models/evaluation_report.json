@@ -1,0 +1,29 @@
+{
+  "total": 364,
+  "anomalies": 19,
+  "normals": 345,
+  "features": [
+    "cpu_max_pct",
+    "cpu_avg_pct",
+    "mem_used_pct",
+    "mem_avail_mb",
+    "disk_read_mb",
+    "disk_write_mb",
+    "net_sent_mb",
+    "net_recv_mb",
+    "top_proc_cpu"
+  ],
+  "contamination": 0.05,
+  "rolling_baseline": {
+    "rolling_window": 20,
+    "z_threshold": 2.0,
+    "static_fp": 300,
+    "smart_fp": 11,
+    "smart_tp": 10,
+    "smart_fn": 10,
+    "smart_tn": 333,
+    "fp_eliminated": 289,
+    "static_cpu_thresh": 80.0,
+    "static_mem_thresh": 85.0
+  }
+}
