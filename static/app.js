@@ -226,84 +226,74 @@ function filterTable() {
   loadLogs(state.currentPage);
 }
 
-/* ── LIVE STREAM ───────────────────────────────────────── */
+/* ── LIVE STREAM (polling — Vercel compatible) ─────────────── */
 function startStream() {
   if (state.streaming) {
     stopStream();
     return;
   }
 
-  // Connect SSE
-  if (state.eventSource) state.eventSource.close();
-  state.eventSource = new EventSource('/api/stream');
+  state.streaming = true;
+  state.liveCount = 0;
+  document.getElementById('btn-stream').innerHTML = '<span class="spinner"></span> Loading...';
+  document.getElementById('btn-stream').disabled = true;
+  document.getElementById('live-feed').innerHTML = '';
+  setStreamBadge('streaming');
 
-  state.eventSource.onmessage = (e) => {
-    const data = JSON.parse(e.data);
-    handleSSEEvent(data);
-  };
-
-  state.eventSource.onerror = () => {
-    setStreamBadge('error');
-    state.streaming = false;
-    document.getElementById('btn-stream').textContent = '▶ Start Live Stream';
-  };
-
-  // Trigger backend to start streaming
-  fetch('/api/run-stream', { method: 'POST' })
+  fetch('/api/logs-stream')
     .then(r => r.json())
-    .then(() => {
-      state.streaming = true;
-      state.liveCount = 0;
-      document.getElementById('btn-stream').innerHTML = '⏹ Stop Stream';
-      document.getElementById('live-feed').innerHTML = '';
-      setStreamBadge('streaming');
+    .then(data => {
+      if (data.error) {
+        showToast('anomaly', '❌ Error', data.error);
+        stopStream();
+        return;
+      }
+
+      showToast('info', '▶ Stream Started', `Replaying ${data.total} log entries...`);
+
+      // Replay entries with a small delay between each for visual effect
+      let i = 0;
+      const entries = data.entries;
+
+      function playNext() {
+        if (i >= entries.length || !state.streaming) {
+          showToast('success', '✅ Stream Complete',
+            `${data.normals} normal · ${data.anomalies} anomalies`);
+          stopStream();
+          loadStats();
+          return;
+        }
+
+        const entry = entries[i++];
+        state.liveCount++;
+        document.getElementById('live-count').textContent = `${state.liveCount} events`;
+
+        pushChartPoint(entry.timestamp, entry.cpu, entry.mem);
+        addFeedItem(entry);
+
+        if (entry.is_anomaly) {
+          showToast('anomaly', '🔴 Anomaly Detected',
+            `${entry.anomaly_type} · CPU ${entry.cpu}% · Mem ${entry.mem}%`);
+        }
+
+        // Pace the replay — faster for normal, slight pause on anomaly
+        const delay = entry.is_anomaly ? 300 : 80;
+        setTimeout(playNext, delay);
+      }
+
+      playNext();
+    })
+    .catch(err => {
+      showToast('anomaly', '❌ Stream Error', err.message);
+      stopStream();
     });
 }
 
 function stopStream() {
-  if (state.eventSource) {
-    state.eventSource.close();
-    state.eventSource = null;
-  }
   state.streaming = false;
   document.getElementById('btn-stream').textContent = '▶ Start Live Stream';
+  document.getElementById('btn-stream').disabled = false;
   setStreamBadge('idle');
-}
-
-function handleSSEEvent(data) {
-  if (data.type === 'connected' || data.type === 'heartbeat') return;
-
-  if (data.type === 'stream_start') {
-    showToast('info', '▶ Stream Started', data.message);
-    return;
-  }
-
-  if (data.type === 'stream_end') {
-    showToast('success', '✅ Stream Complete',
-      `${data.normals} normal · ${data.anomalies} anomalies`);
-    setStreamBadge('idle');
-    state.streaming = false;
-    document.getElementById('btn-stream').textContent = '▶ Start Live Stream';
-    loadStats();
-    return;
-  }
-
-  if (data.type === 'log_entry') {
-    state.liveCount++;
-    document.getElementById('live-count').textContent = `${state.liveCount} events`;
-
-    pushChartPoint(data.timestamp, data.cpu, data.mem);
-    addFeedItem(data);
-
-    if (data.is_anomaly) {
-      showToast('anomaly', '🔴 Anomaly Detected',
-        `${data.anomaly_type} · CPU ${data.cpu}% · Mem ${data.mem}%`);
-    }
-  }
-
-  if (data.type === 'pipeline') {
-    handlePipelineEvent(data);
-  }
 }
 
 function addFeedItem(data) {
@@ -328,55 +318,12 @@ function addFeedItem(data) {
 
 /* ── PIPELINE ──────────────────────────────────────────── */
 function runPipeline() {
-  const panel = document.getElementById('pipeline-status');
-  const steps = document.getElementById('pipeline-steps');
-  panel.classList.remove('hidden');
-  steps.innerHTML = '';
-
-  // Connect SSE if not already
-  if (!state.eventSource) {
-    state.eventSource = new EventSource('/api/stream');
-    state.eventSource.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      handleSSEEvent(data);
-    };
-  }
-
-  fetch('/api/run-pipeline', { method: 'POST' })
-    .then(r => r.json())
-    .then(() => {
-      document.getElementById('btn-pipeline').disabled = true;
-      showToast('info', '⚙ Pipeline Started', 'Running Phase 1 → 2 → 4...');
-    });
+  showToast('info', 'ℹ️ Pipeline Info',
+    'Pipeline runs locally. Run: python3 phase4_ml_model.py then redeploy.');
+  closePipeline();
 }
 
-function handlePipelineEvent(data) {
-  const steps = document.getElementById('pipeline-steps');
-  const icons = { phase1: '📝', phase2: '🔍', phase4: '🧠', done: '✅', error: '❌', start: '🚀' };
-  const icon  = icons[data.step] || '•';
-
-  const cls = data.step === 'done'  ? 'step-done'
-            : data.step === 'error' ? 'step-error'
-            : data.success === false ? 'step-error'
-            : data.success === true  ? 'step-done'
-            : 'step-active';
-
-  const el = document.createElement('div');
-  el.className = `pipeline-step ${cls}`;
-  el.innerHTML = `<span class="step-icon">${icon}</span><span class="step-msg">${data.message || data.step}</span>`;
-  steps.appendChild(el);
-
-  if (data.step === 'done') {
-    document.getElementById('btn-pipeline').disabled = false;
-    loadStats();
-    loadLogs(1);
-    showToast('success', '✅ Pipeline Done', 'Model retrained and ready.');
-  }
-  if (data.step === 'error') {
-    document.getElementById('btn-pipeline').disabled = false;
-    showToast('anomaly', '❌ Pipeline Error', data.message || 'A step failed.');
-  }
-}
+function handlePipelineEvent(data) {}
 
 function closePipeline() {
   document.getElementById('pipeline-status').classList.add('hidden');

@@ -1,82 +1,63 @@
 """
-Phase 5 — Flask Web Dashboard
-==============================
+Phase 5 — Flask Web Dashboard (Vercel-compatible)
+===================================================
 Real-Time Log Anomaly Detection — Web Interface
-Endpoints:
-  GET  /                    → Dashboard HTML
-  GET  /api/stats           → Summary stats from CSV
-  GET  /api/logs            → All parsed log entries
-  GET  /api/stream          → SSE stream (live anomaly detection)
-  POST /api/predict         → Predict single log line
-  POST /api/run-pipeline    → Run Phase1 → Phase2 → Phase4 pipeline
+
+Vercel notes:
+  - No background threads (serverless = stateless)
+  - No SSE streaming (no persistent connections)
+  - Live stream replaced with /api/logs-stream (returns all at once)
+  - Models + static CSV loaded from repo at cold start
 """
 
 import os
 import sys
 import json
-import time
-import threading
-import queue
 import joblib
-import numpy as np
+import numpy  as np
 import pandas as pd
 from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
 
 # bring existing modules into scope
-sys.path.insert(0, os.path.dirname(__file__))
-from phase2_log_parser import parse_line, parse_log_file, save_to_csv
-from phase4_ml_model   import predict_single, FEATURE_COLS
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from phase2_log_parser import parse_line
+from phase4_ml_model   import predict_single, FEATURE_COLS, RollingBaseline, smart_alert
 
 # ─────────────────────────────────────────
 #  APP SETUP
 # ─────────────────────────────────────────
-app = Flask(__name__, static_folder="static", static_url_path="/static", template_folder="static")
+app = Flask(__name__,
+            static_folder="static",
+            static_url_path="/static",
+            template_folder="static")
 CORS(app)
 
-MODEL_PATH  = "models/anomaly_model.pkl"
-SCALER_PATH = "models/scaler.pkl"
-CSV_PATH    = "data/parsed_logs.csv"
-LOG_PATH    = "logs/server.log"
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH  = os.path.join(BASE_DIR, "models", "anomaly_model.pkl")
+SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.pkl")
+CSV_PATH    = os.path.join(BASE_DIR, "data",   "parsed_logs.csv")
+LOG_PATH    = os.path.join(BASE_DIR, "logs",   "server.log")
+REPORT_PATH = os.path.join(BASE_DIR, "models", "evaluation_report.json")
 
-# Global model cache
+# ─────────────────────────────────────────
+#  LOAD MODEL AT STARTUP
+# ─────────────────────────────────────────
 _model  = None
 _scaler = None
 
-# SSE clients queue list
-_sse_clients = []
-_sse_lock    = threading.Lock()
-
-
 def load_model():
     global _model, _scaler
-    if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
-        _model  = joblib.load(MODEL_PATH)
-        _scaler = joblib.load(SCALER_PATH)
-        return True
+    try:
+        if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
+            _model  = joblib.load(MODEL_PATH)
+            _scaler = joblib.load(SCALER_PATH)
+            return True
+    except Exception as e:
+        print(f"Model load error: {e}")
     return False
 
-
 load_model()
-
-
-# ─────────────────────────────────────────
-#  SSE HELPER
-# ─────────────────────────────────────────
-
-def push_sse_event(data: dict):
-    """Push an event to all connected SSE clients."""
-    msg = f"data: {json.dumps(data)}\n\n"
-    with _sse_lock:
-        dead = []
-        for q in _sse_clients:
-            try:
-                q.put_nowait(msg)
-            except Exception:
-                dead.append(q)
-        for q in dead:
-            _sse_clients.remove(q)
-
 
 # ─────────────────────────────────────────
 #  ROUTES — Static
@@ -86,6 +67,9 @@ def push_sse_event(data: dict):
 def index():
     return send_from_directory("static", "index.html")
 
+@app.route("/static/<path:filename>")
+def static_files(filename):
+    return send_from_directory("static", filename)
 
 # ─────────────────────────────────────────
 #  ROUTES — API
@@ -95,63 +79,142 @@ def index():
 def api_stats():
     """Return summary statistics from the parsed CSV."""
     if not os.path.exists(CSV_PATH):
-        return jsonify({"error": "No data yet. Run the pipeline first."}), 404
+        return jsonify({"error": "No data found. CSV not available."}), 404
 
-    df = pd.read_csv(CSV_PATH)
-    total     = len(df)
-    anomalies = int(df["is_anomaly"].sum())
-    normals   = total - anomalies
+    try:
+        df = pd.read_csv(CSV_PATH)
+        total     = len(df)
+        anomalies = int(df["is_anomaly"].sum())
+        normals   = total - anomalies
 
-    stats = {
-        "total"          : total,
-        "normals"        : normals,
-        "anomalies"      : anomalies,
-        "anomaly_pct"    : round(100 * anomalies / total, 1) if total else 0,
-        "cpu_avg"        : round(float(df["cpu_max_pct"].mean()), 1),
-        "cpu_max"        : round(float(df["cpu_max_pct"].max()), 1),
-        "mem_avg"        : round(float(df["mem_used_pct"].mean()), 1),
-        "mem_max"        : round(float(df["mem_used_pct"].max()), 1),
-        "anomaly_types"  : df[df["is_anomaly"] == 1]["anomaly_type"].value_counts().to_dict(),
-        "model_loaded"   : _model is not None,
-    }
-    return jsonify(stats)
+        # Rolling baseline report if available
+        rolling = {}
+        if os.path.exists(REPORT_PATH):
+            with open(REPORT_PATH) as f:
+                report = json.load(f)
+            rolling = report.get("rolling_baseline", {})
+
+        return jsonify({
+            "total"         : total,
+            "normals"       : normals,
+            "anomalies"     : anomalies,
+            "anomaly_pct"   : round(100 * anomalies / total, 1) if total else 0,
+            "cpu_avg"       : round(float(df["cpu_max_pct"].mean()), 1),
+            "cpu_max"       : round(float(df["cpu_max_pct"].max()), 1),
+            "mem_avg"       : round(float(df["mem_used_pct"].mean()), 1),
+            "mem_max"       : round(float(df["mem_used_pct"].max()), 1),
+            "anomaly_types" : df[df["is_anomaly"] == 1]["anomaly_type"].value_counts().to_dict(),
+            "model_loaded"  : _model is not None,
+            "rolling_baseline": rolling,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/logs")
 def api_logs():
-    """Return all log entries (paginated)."""
+    """Return paginated log entries."""
     if not os.path.exists(CSV_PATH):
-        return jsonify({"error": "No data yet."}), 404
+        return jsonify({"error": "No data found."}), 404
 
-    page     = int(request.args.get("page", 1))
-    per_page = int(request.args.get("per_page", 50))
-    filter_  = request.args.get("filter", "all")   # all | anomaly | normal
+    try:
+        page     = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 50))
+        filter_  = request.args.get("filter", "all")
 
-    df = pd.read_csv(CSV_PATH)
+        df = pd.read_csv(CSV_PATH)
 
-    if filter_ == "anomaly":
-        df = df[df["is_anomaly"] == 1]
-    elif filter_ == "normal":
-        df = df[df["is_anomaly"] == 0]
+        if filter_ == "anomaly":
+            df = df[df["is_anomaly"] == 1]
+        elif filter_ == "normal":
+            df = df[df["is_anomaly"] == 0]
 
-    total   = len(df)
-    start   = (page - 1) * per_page
-    end     = start + per_page
-    records = df.iloc[start:end].fillna("").to_dict(orient="records")
+        total   = len(df)
+        start   = (page - 1) * per_page
+        end     = start + per_page
+        records = df.iloc[start:end].fillna("").to_dict(orient="records")
 
-    return jsonify({
-        "total"   : total,
-        "page"    : page,
-        "pages"   : (total + per_page - 1) // per_page,
-        "records" : records,
-    })
+        return jsonify({
+            "total"  : total,
+            "page"   : page,
+            "pages"  : max(1, (total + per_page - 1) // per_page),
+            "records": records,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/logs-stream")
+def api_logs_stream():
+    """
+    Returns all log entries scored by the ML model + rolling baseline.
+    Used by the frontend to simulate a live stream via polling.
+    (Replaces SSE which doesn't work on Vercel serverless.)
+    """
+    if _model is None or _scaler is None:
+        return jsonify({"error": "Model not loaded."}), 503
+
+    if not os.path.exists(CSV_PATH):
+        return jsonify({"error": "No CSV data found."}), 404
+
+    try:
+        df = pd.read_csv(CSV_PATH)
+        cpu_bl = RollingBaseline()
+        mem_bl = RollingBaseline()
+        results = []
+
+        for _, row in df.iterrows():
+            entry = row.to_dict()
+            cpu   = float(entry.get("cpu_max_pct", 0) or 0)
+            mem   = float(entry.get("mem_used_pct", 0) or 0)
+
+            # Isolation Forest
+            features = np.array([[entry.get(f, 0) for f in FEATURE_COLS]])
+            scaled   = _scaler.transform(features)
+            raw      = _model.predict(scaled)[0]
+            score    = float(_model.score_samples(scaled)[0])
+            iso_anom = 1 if raw == -1 else 0
+
+            # Rolling baseline + Z-score
+            smart, reason = smart_alert(cpu, mem, cpu_bl, mem_bl)
+            is_anomaly    = 1 if (iso_anom or smart) else 0
+
+            results.append({
+                "timestamp"   : entry.get("timestamp", ""),
+                "cpu"         : cpu,
+                "mem"         : mem,
+                "disk_r"      : entry.get("disk_read_mb", 0),
+                "disk_w"      : entry.get("disk_write_mb", 0),
+                "net_s"       : entry.get("net_sent_mb", 0),
+                "net_r"       : entry.get("net_recv_mb", 0),
+                "proc"        : entry.get("top_proc_name", ""),
+                "is_anomaly"  : is_anomaly,
+                "iso_anomaly" : iso_anom,
+                "smart_alert" : int(smart),
+                "smart_reason": reason,
+                "label"       : "ANOMALY" if is_anomaly else "NORMAL",
+                "score"       : round(score, 4),
+                "anomaly_type": entry.get("anomaly_type", "none"),
+            })
+
+        normals   = sum(1 for r in results if not r["is_anomaly"])
+        anomalies = sum(1 for r in results if r["is_anomaly"])
+
+        return jsonify({
+            "total"    : len(results),
+            "normals"  : normals,
+            "anomalies": anomalies,
+            "entries"  : results,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/predict", methods=["POST"])
 def api_predict():
     """Predict anomaly for a single raw log line."""
     if _model is None or _scaler is None:
-        return jsonify({"error": "Model not loaded. Run the pipeline first."}), 503
+        return jsonify({"error": "Model not loaded."}), 503
 
     data    = request.get_json()
     raw_log = data.get("raw_log", "")
@@ -165,155 +228,17 @@ def api_predict():
 
     result = predict_single(parsed, _model, _scaler)
     result["timestamp"]    = parsed.get("timestamp")
-    result["cpu_max_pct"]  = parsed.get("cpu_max_pct")
-    result["mem_used_pct"] = parsed.get("mem_used_pct")
     result["top_proc"]     = parsed.get("top_proc_name")
     return jsonify(result)
 
 
-@app.route("/api/stream")
-def api_stream():
-    """
-    Server-Sent Events endpoint.
-    Streams live anomaly detection results as the log file is replayed.
-    """
-    client_q = queue.Queue(maxsize=200)
-    with _sse_lock:
-        _sse_clients.append(client_q)
-
-    def generate():
-        # Send a heartbeat first so browser knows connection is alive
-        yield "data: {\"type\": \"connected\"}\n\n"
-        try:
-            while True:
-                try:
-                    msg = client_q.get(timeout=20)
-                    yield msg
-                except queue.Empty:
-                    yield "data: {\"type\": \"heartbeat\"}\n\n"
-        except GeneratorExit:
-            with _sse_lock:
-                if client_q in _sse_clients:
-                    _sse_clients.remove(client_q)
-
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control" : "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.route("/api/run-stream", methods=["POST"])
-def api_run_stream():
-    """
-    Replay the log file through the ML model and push results via SSE.
-    Runs in a background thread so the HTTP response returns immediately.
-    """
-    if _model is None or _scaler is None:
-        return jsonify({"error": "Model not loaded. Run the pipeline first."}), 503
-
-    if not os.path.exists(LOG_PATH):
-        return jsonify({"error": "Log file not found. Run Phase 1 first."}), 404
-
-    def stream_worker():
-        push_sse_event({"type": "stream_start", "message": "Starting live stream..."})
-        normal_count  = 0
-        anomaly_count = 0
-
-        with open(LOG_PATH, "r") as f:
-            for raw_line in f:
-                parsed = parse_line(raw_line)
-                if not parsed:
-                    continue
-
-                result = predict_single(parsed, _model, _scaler)
-                event  = {
-                    "type"        : "log_entry",
-                    "timestamp"   : parsed["timestamp"],
-                    "cpu"         : parsed["cpu_max_pct"],
-                    "mem"         : parsed["mem_used_pct"],
-                    "disk_r"      : parsed["disk_read_mb"],
-                    "disk_w"      : parsed["disk_write_mb"],
-                    "net_s"       : parsed["net_sent_mb"],
-                    "net_r"       : parsed["net_recv_mb"],
-                    "proc"        : parsed["top_proc_name"],
-                    "is_anomaly"  : result["is_anomaly"],
-                    "label"       : result["label"],
-                    "score"       : result["score"],
-                    "anomaly_type": parsed.get("anomaly_type", "none"),
-                }
-
-                if result["is_anomaly"]:
-                    anomaly_count += 1
-                else:
-                    normal_count += 1
-
-                push_sse_event(event)
-                time.sleep(0.15)   # pacing for visual effect
-
-        push_sse_event({
-            "type"    : "stream_end",
-            "normals" : normal_count,
-            "anomalies": anomaly_count,
-            "message" : f"Stream complete. {normal_count} normal, {anomaly_count} anomalies.",
-        })
-
-    t = threading.Thread(target=stream_worker, daemon=True)
-    t.start()
-    return jsonify({"status": "streaming started"})
-
-
-@app.route("/api/run-pipeline", methods=["POST"])
-def api_run_pipeline():
-    """
-    Run Phase1 (log gen) → Phase2 (parse) → Phase4 (train) in sequence.
-    Streams progress via SSE.
-    """
-    import subprocess
-
-    def pipeline_worker():
-        push_sse_event({"type": "pipeline", "step": "start", "message": "Pipeline starting..."})
-
-        steps = [
-            ("phase1", ["python3", "phase1_log_generator.py"], "Generating logs..."),
-            ("phase2", ["python3", "phase2_log_parser.py"],    "Parsing logs..."),
-            ("phase4", ["python3", "phase4_ml_model.py"],      "Training ML model..."),
-        ]
-
-        for step_id, cmd, msg in steps:
-            push_sse_event({"type": "pipeline", "step": step_id, "message": msg})
-            try:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=300
-                )
-                success = result.returncode == 0
-                push_sse_event({
-                    "type"   : "pipeline",
-                    "step"   : step_id,
-                    "success": success,
-                    "output" : result.stdout[-500:] if result.stdout else "",
-                    "error"  : result.stderr[-300:] if result.stderr else "",
-                })
-                if not success:
-                    push_sse_event({"type": "pipeline", "step": "error",
-                                    "message": f"Step {step_id} failed."})
-                    return
-            except subprocess.TimeoutExpired:
-                push_sse_event({"type": "pipeline", "step": "error",
-                                "message": f"Step {step_id} timed out."})
-                return
-
-        # Reload model after pipeline
-        load_model()
-        push_sse_event({"type": "pipeline", "step": "done",
-                        "message": "Pipeline complete! Model reloaded."})
-
-    t = threading.Thread(target=pipeline_worker, daemon=True)
-    t.start()
-    return jsonify({"status": "pipeline started"})
+@app.route("/api/health")
+def api_health():
+    return jsonify({
+        "status"      : "ok",
+        "model_loaded": _model is not None,
+        "csv_exists"  : os.path.exists(CSV_PATH),
+    })
 
 
 # ─────────────────────────────────────────
